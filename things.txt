@@ -1,0 +1,2 @@
+ docker exec -d mininet-dev ryu-manager ryu.app.simple_switch_13 --ofp-tcp-listen-port 6653
+ 
