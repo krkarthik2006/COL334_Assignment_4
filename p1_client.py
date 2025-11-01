@@ -10,8 +10,8 @@ HEADER_SIZE = 20
 REQUEST_TIMEOUT = 2.0
 MAX_REQUEST_RETRIES = 5
 EOF_MARKER = b"EOF"
-ACK_INTERVAL = 0.00001  # Send ACKs immediately for best performance
-DELAYED_ACK_THRESHOLD = 5  # Send ACK after every N packets
+ACK_INTERVAL = 0.005  # Send ACKs very quickly
+DELAYED_ACK_THRESHOLD = 1  # ACK every packet for maximum throughput
 
 class ReliableUDPClient:
     def __init__(self, server_ip, server_port):
@@ -140,7 +140,7 @@ class ReliableUDPClient:
         total_bytes = 0
         eof_received = False
         last_activity = time.time()
-        stall_timeout = 5.0  # If no packets for 5 seconds, assume done
+        stall_timeout = 3.0  # If no packets for 3 seconds, assume done
 
         print("Receiving file...")
 
@@ -150,8 +150,8 @@ class ReliableUDPClient:
                 print("Connection stalled, finishing...")
                 break
 
-            # Receive packets
-            ready = select.select([self.socket], [], [], 0.1)
+            # Receive packets - very short timeout for better responsiveness
+            ready = select.select([self.socket], [], [], 0.01)
 
             if ready[0]:
                 try:
@@ -177,35 +177,29 @@ class ReliableUDPClient:
                             self.packets_since_ack += 1
 
                             # Update next_expected if we received the next in-order packet
-                            advanced = False
                             while self.next_expected in self.received_data:
                                 self.next_expected += len(self.received_data[self.next_expected])
-                                advanced = True
 
-                            # Determine if this is an out-of-order packet
-                            is_out_of_order = (seq_num + len(data)) != self.next_expected
-
-                            # Always send ACK immediately for best performance
-                            # Immediate ACKs help server advance window faster and reduce retransmissions
-                            # For high-throughput scenarios, immediate feedback is critical
+                            # ACK every packet immediately for best throughput in lossy conditions
+                            # With 1-5% loss, aggressive ACKing helps server advance window faster
                             self.send_ack()
                         else:
-                            # Duplicate packet - send ACK immediately
+                            # Duplicate packet - send ACK immediately (helps server)
                             self.send_ack()
 
                 except socket.error:
                     pass
 
             # Send periodic ACKs even if no new packets (duplicate ACKs for reliability)
-            # More frequent periodic ACKs for faster convergence
+            # Very fast periodic ACKs for low latency
             current_time = time.time()
             if current_time - self.last_ack_sent_time >= 0.01:  # At least every 10ms
                 self.send_ack()
 
-        # Send final ACKs to ensure server knows we're done - reduced overhead
-        for _ in range(3):
-            self.send_ack()
-            time.sleep(0.01)
+        # Send final ACKs to ensure server knows we're done - minimal overhead
+        self.send_ack()
+        time.sleep(0.01)
+        self.send_ack()
 
         print(f"Received {packets_received} packets, {total_bytes} bytes")
 

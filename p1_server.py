@@ -9,10 +9,10 @@ MAX_PACKET_SIZE = 1200
 HEADER_SIZE = 20
 MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
 EOF_MARKER = b"EOF"
-INITIAL_TIMEOUT = 0.3
-TIMEOUT_MULTIPLIER = 1.3
-MAX_TIMEOUT = 1.5
-MIN_TIMEOUT = 0.05
+INITIAL_TIMEOUT = 0.15
+TIMEOUT_MULTIPLIER = 1.2
+MAX_TIMEOUT = 0.8
+MIN_TIMEOUT = 0.025
 
 class ReliableUDPServer:
     def __init__(self, server_ip, server_port, sws):
@@ -51,8 +51,11 @@ class ReliableUDPServer:
             self.srtt = (1 - alpha) * self.srtt + alpha * sample_rtt
 
         # Calculate RTO with bounds - more aggressive for better throughput
-        self.rto = self.srtt + max(0.005, 3 * self.rttvar)
-        self.rto = max(MIN_TIMEOUT, min(MAX_TIMEOUT, self.rto))
+        self.rto = self.srtt + 4 * self.rttvar  # Simplified, TCP uses 4*rttvar
+        if self.rto < MIN_TIMEOUT:
+            self.rto = MIN_TIMEOUT
+        elif self.rto > MAX_TIMEOUT:
+            self.rto = MAX_TIMEOUT
 
     def create_packet(self, seq_num, data):
         """Create a packet with sequence number and data"""
@@ -99,9 +102,6 @@ class ReliableUDPServer:
         dup_ack_count = {}  # Track duplicate ACKs for fast retransmit
         last_ack_received = 0
 
-        # Effective window size - use at least 4 * MAX_DATA_SIZE for better pipeline effect
-        # This allows more packets in flight for better throughput
-        effective_sws = max(self.sws, 4 * MAX_DATA_SIZE)
 
         # Set socket to non-blocking for better control
         self.socket.setblocking(False)
@@ -112,7 +112,7 @@ class ReliableUDPServer:
 
         while base < total_size:
             # Send new packets while window allows
-            while next_seq < total_size and (next_seq - base) < effective_sws:
+            while next_seq < total_size and (next_seq - base) < self.sws:
                 # Read chunk of data
                 chunk_start = next_seq
                 chunk_end = min(next_seq + MAX_DATA_SIZE, total_size)
@@ -127,13 +127,13 @@ class ReliableUDPServer:
                 next_seq = chunk_end
                 total_packets_sent += 1
 
-            # Wait for ACKs with timeout
-            timeout = self.rto
+            # Wait for ACKs with timeout - optimized for minimal waiting
+            timeout = 0.01  # Very short timeout for better responsiveness
             if window_packets:
                 # Use minimum timeout of packets in flight
                 min_time = min(send_time for _, send_time, _ in window_packets.values())
                 elapsed = time.time() - min_time
-                timeout = max(0.001, self.rto - elapsed)
+                timeout = max(0.001, min(0.01, self.rto - elapsed))
 
             ready = select.select([self.socket], [], [], timeout)
 
@@ -147,9 +147,12 @@ class ReliableUDPServer:
 
                     if ack_num is not None:
                         # Update RTT estimation if this ACK acknowledges new data
+                        # Karn's Algorithm: only use RTT from non-retransmitted packets
                         if ack_num > base and base in window_packets:
-                            sample_rtt = recv_time - window_packets[base][1]
-                            self.calculate_rto(sample_rtt)
+                            _, send_time, retrans_count = window_packets[base]
+                            if retrans_count == 0:  # Only use original transmissions
+                                sample_rtt = recv_time - send_time
+                                self.calculate_rto(sample_rtt)
 
                         # Handle cumulative ACK
                         if ack_num > base:
@@ -175,28 +178,24 @@ class ReliableUDPServer:
 
                         # Handle SACK blocks if present - selective retransmission
                         if sack_blocks:
+                            now = time.time()
                             # Remove SACKed packets from retransmission list
                             for start, end in sack_blocks:
                                 for seq in list(window_packets.keys()):
-                                    if start <= seq < end:
-                                        # Mark as received but don't advance base
-                                        if seq != base:
-                                            del window_packets[seq]
+                                    if start <= seq < end and seq != base:
+                                        del window_packets[seq]
 
-                            # Proactively retransmit gaps (packets missing between base and SACKed regions)
-                            # This is selective retransmission for better performance
-                            if sack_blocks and base in window_packets:
+                            # Proactively retransmit gaps - combined with removal for efficiency
+                            if base in window_packets:
                                 first_sack_start = min(start for start, _ in sack_blocks)
-                                # Find packets between base and first SACK block that need retransmission
-                                now = time.time()
-                                for seq in sorted(window_packets.keys()):
+                                # Find and retransmit missing packets immediately
+                                for seq in list(window_packets.keys()):
                                     if base < seq < first_sack_start:
                                         packet, send_time, retrans_count = window_packets[seq]
-                                        # Only retransmit if enough time has passed (avoid excessive retrans)
-                                        if now - send_time > self.rto * 0.5:
-                                            self.socket.sendto(packet, client_addr)
-                                            window_packets[seq] = (packet, now, retrans_count + 1)
-                                            retransmissions += 1
+                                        # Immediate retransmission of gaps
+                                        self.socket.sendto(packet, client_addr)
+                                        window_packets[seq] = (packet, now, retrans_count + 1)
+                                        retransmissions += 1
 
                 except socket.error:
                     pass
@@ -217,11 +216,11 @@ class ReliableUDPServer:
                         if retrans_count >= 2:
                             self.rto = min(MAX_TIMEOUT, self.rto * TIMEOUT_MULTIPLIER)
 
-        # Send EOF marker - reduced overhead while ensuring delivery
+        # Send EOF marker - minimal overhead while ensuring delivery
         eof_packet = self.create_packet(total_size, EOF_MARKER)
-        for _ in range(3):  # Send multiple times to ensure delivery
-            self.socket.sendto(eof_packet, client_addr)
-            time.sleep(0.01)
+        self.socket.sendto(eof_packet, client_addr)
+        time.sleep(0.01)
+        self.socket.sendto(eof_packet, client_addr)
 
         print(f"File transfer complete. Total packets: {total_packets_sent}, Retransmissions: {retransmissions}")
 

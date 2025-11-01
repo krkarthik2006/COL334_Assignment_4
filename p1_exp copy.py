@@ -55,9 +55,9 @@ def run(expname):
 
     SERVER_IP = "10.0.0.1"
     SERVER_PORT = 6555
-    SWS = 5*1180
+    SWS = 5 * 1180
             
-    NUM_ITERATIONS = 1
+    NUM_ITERATIONS = 5 
     OUTFILE = 'received_data.txt'
     delay_list, loss_list, jitter_list = [], [], []
 
@@ -80,9 +80,7 @@ def run(expname):
         for DELAY in delay_list:
             for JITTER in jitter_list:
                 for i in range(0, NUM_ITERATIONS):
-                    print(f"\n{'='*60}")
-                    print(f"Running: Loss={LOSS}%, Delay={DELAY}ms, Jitter={JITTER}ms, Iteration {i+1}/{NUM_ITERATIONS}")
-                    print(f"{'='*60}")
+                    print(f"\n--- Running topology with {LOSS}% packet loss, base delay {DELAY}ms and jitter {JITTER}ms (iter {i+1}/{NUM_ITERATIONS})")
 
                     # Create the custom topology with the specified loss, delay and jitter
                     topo = CustomTopo(loss=LOSS, delay=DELAY, jitter=JITTER)
@@ -100,22 +98,16 @@ def run(expname):
                     h1 = net.get('h1')
                     h2 = net.get('h2')
 
-                    # Start server
-                    script_dir = "/app/projects/COL334_Assignment_4"
                     start_time = time.time()
-                    h1.cmd(f"cd {script_dir} && python3 p1_server.py {SERVER_IP} {SERVER_PORT} {SWS} > /tmp/server_{i}.log 2>&1 &")
-                    result = h2.cmd(f"cd {script_dir} && python3 p1_client.py {SERVER_IP} {SERVER_PORT}")
+                    
+                    h1.cmd(f"python3 p1_server.py {SERVER_IP} {SERVER_PORT} {SWS} &")
+                    result = h2.cmd(f"python3 p1_client.py {SERVER_IP} {SERVER_PORT}")
                     end_time = time.time()
                     ttc = end_time - start_time
-                    print(f"Transfer completed in {ttc:.2f} seconds")
 
-                    md5_hash = compute_md5(f"{script_dir}/{OUTFILE}")
+                    md5_hash = compute_md5(OUTFILE)
                     # write the result to a file
                     f_out.write(f"{i},{LOSS},{DELAY},{JITTER},{md5_hash},{ttc}\n")
-                    f_out.flush()  # Ensure data is written to disk
-
-                    # Clean up: kill any remaining server processes
-                    h1.cmd("killall -9 python3 2>/dev/null")
 
                     # Stop the network
                     net.stop()
