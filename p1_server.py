@@ -85,14 +85,15 @@ class ReliableUDPServer:
 
     def send_file(self, client_addr):
         """Send file using sliding window protocol with advanced features"""
+        # Get file size without reading entire file into memory
         try:
-            with open('data.txt', 'rb') as f:
-                file_data = f.read()
+            import os
+            total_size = os.path.getsize('data.txt')
+            file_handle = open('data.txt', 'rb')
         except FileNotFoundError:
             print("Error: data.txt not found")
             return
 
-        total_size = len(file_data)
         print(f"Sending file of size {total_size} bytes to {client_addr}")
 
         # Window management
@@ -110,13 +111,16 @@ class ReliableUDPServer:
         total_packets_sent = 0
         retransmissions = 0
 
-        while base < total_size:
+        while base <= total_size:
             # Send new packets while window allows
             while next_seq < total_size and (next_seq - base) < self.sws:
-                # Read chunk of data
+                # Read chunk of data from file on-demand
                 chunk_start = next_seq
                 chunk_end = min(next_seq + MAX_DATA_SIZE, total_size)
-                data = file_data[chunk_start:chunk_end]
+
+                # Seek to position and read chunk
+                file_handle.seek(chunk_start)
+                data = file_handle.read(chunk_end - chunk_start)
 
                 # Create and send packet
                 packet = self.create_packet(next_seq, data)
@@ -127,13 +131,23 @@ class ReliableUDPServer:
                 next_seq = chunk_end
                 total_packets_sent += 1
 
-            # Wait for ACKs with timeout - optimized for minimal waiting
-            timeout = 0.01  # Very short timeout for better responsiveness
-            if window_packets:
-                # Use minimum timeout of packets in flight
-                min_time = min(send_time for _, send_time, _ in window_packets.values())
-                elapsed = time.time() - min_time
-                timeout = max(0.001, min(0.01, self.rto - elapsed))
+            # Send EOF packet after all data is sent
+            if next_seq == total_size and total_size not in window_packets:
+                eof_packet = self.create_packet(total_size, EOF_MARKER)
+                self.socket.sendto(eof_packet, client_addr)
+                window_packets[total_size] = (eof_packet, time.time(), 0)
+                total_packets_sent += 1
+
+            # Wait for ACKs with timeout - let OS handle waiting efficiently
+            timeout = 0.01  # Default timeout if no packets in flight to check for ACKs
+
+            if base in window_packets:
+                # Get the send time of the OLDEST unacked packet (base)
+                base_send_time = window_packets[base][1]
+                elapsed = time.time() - base_send_time
+
+                # Calculate time remaining until this packet times out
+                timeout = max(0.001, self.rto - elapsed)
 
             ready = select.select([self.socket], [], [], timeout)
 
@@ -185,17 +199,20 @@ class ReliableUDPServer:
                                     if start <= seq < end and seq != base:
                                         del window_packets[seq]
 
-                            # Proactively retransmit gaps - combined with removal for efficiency
-                            if base in window_packets:
-                                first_sack_start = min(start for start, _ in sack_blocks)
-                                # Find and retransmit missing packets immediately
+                            # Proactively retransmit gaps - all holes up to max SACK end
+                            if base in window_packets and sack_blocks:
+                                max_sack_end = max(end for _, end in sack_blocks)
+                                # Find and retransmit ALL missing packets (not covered by SACK)
                                 for seq in list(window_packets.keys()):
-                                    if base < seq < first_sack_start:
-                                        packet, send_time, retrans_count = window_packets[seq]
-                                        # Immediate retransmission of gaps
-                                        self.socket.sendto(packet, client_addr)
-                                        window_packets[seq] = (packet, now, retrans_count + 1)
-                                        retransmissions += 1
+                                    if base < seq < max_sack_end:
+                                        # Check if this seq is covered by any SACK block
+                                        is_sacked = any(start <= seq < end for start, end in sack_blocks)
+                                        if not is_sacked:
+                                            packet, send_time, retrans_count = window_packets[seq]
+                                            # Immediate retransmission of gaps
+                                            self.socket.sendto(packet, client_addr)
+                                            window_packets[seq] = (packet, now, retrans_count + 1)
+                                            retransmissions += 1
 
                 except socket.error:
                     pass
@@ -216,11 +233,8 @@ class ReliableUDPServer:
                         if retrans_count >= 2:
                             self.rto = min(MAX_TIMEOUT, self.rto * TIMEOUT_MULTIPLIER)
 
-        # Send EOF marker - minimal overhead while ensuring delivery
-        eof_packet = self.create_packet(total_size, EOF_MARKER)
-        self.socket.sendto(eof_packet, client_addr)
-        time.sleep(0.01)
-        self.socket.sendto(eof_packet, client_addr)
+        # Close file handle
+        file_handle.close()
 
         print(f"File transfer complete. Total packets: {total_packets_sent}, Retransmissions: {retransmissions}")
 
@@ -230,7 +244,7 @@ class ReliableUDPServer:
 
         try:
             # Wait for client request
-            data, client_addr = self.socket.recvfrom(MAX_PACKET_SIZE)
+            _, client_addr = self.socket.recvfrom(MAX_PACKET_SIZE)
             print(f"Received request from {client_addr}")
 
             # Send file to client
@@ -257,3 +271,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
