@@ -9,10 +9,11 @@ MAX_PACKET_SIZE = 1200
 HEADER_SIZE = 20
 MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
 EOF_MARKER = b"EOF"
-INITIAL_TIMEOUT = 0.15
+INITIAL_TIMEOUT = 0.05
 TIMEOUT_MULTIPLIER = 1.2
-MAX_TIMEOUT = 0.8
-MIN_TIMEOUT = 0.025
+MAX_TIMEOUT = 0.4
+MIN_TIMEOUT = 0.02
+SEND_BATCH_SIZE = 20  # Send packets in batches for better pipelining
 
 class ReliableUDPServer:
     def __init__(self, server_ip, server_port, sws):
@@ -23,8 +24,8 @@ class ReliableUDPServer:
 
         # Increase socket buffer sizes for better performance
         try:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)  # 1MB send buffer
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)  # 1MB receive buffer
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)  # 1MB send buffer
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4194304)  # 1MB receive buffer
         except:
             pass
 
@@ -47,7 +48,9 @@ class ReliableUDPServer:
             self.rttvar = sample_rtt / 2
         else:
             # Update SRTT and RTTVAR
-            self.rttvar = (1 - beta) * self.rttvar + beta * abs(self.srtt - sample_rtt)
+            # Ensure rttvar is a float (and guard against None) before arithmetic to satisfy type checkers
+            prev_rttvar = float(self.rttvar) if self.rttvar is not None else (sample_rtt / 2)
+            self.rttvar = (1 - beta) * prev_rttvar + beta * abs(self.srtt - sample_rtt)
             self.srtt = (1 - alpha) * self.srtt + alpha * sample_rtt
 
         # Calculate RTO with bounds - more aggressive for better throughput
@@ -112,7 +115,8 @@ class ReliableUDPServer:
         retransmissions = 0
 
         while base <= total_size:
-            # Send new packets while window allows
+            # Send new packets while window allows - in batches for better pipelining
+            packets_sent_in_batch = 0
             while next_seq < total_size and (next_seq - base) < self.sws:
                 # Read chunk of data from file on-demand
                 chunk_start = next_seq
@@ -130,6 +134,11 @@ class ReliableUDPServer:
                 window_packets[next_seq] = (packet, time.time(), 0)
                 next_seq = chunk_end
                 total_packets_sent += 1
+                packets_sent_in_batch += 1
+
+                # Send in batches - check for ACKs after sending batch
+                if packets_sent_in_batch >= SEND_BATCH_SIZE:
+                    break
 
             # Send EOF packet after all data is sent
             if next_seq == total_size and total_size not in window_packets:

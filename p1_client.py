@@ -21,8 +21,8 @@ class ReliableUDPClient:
 
         # Increase socket buffer sizes for better performance
         try:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)  # 1MB send buffer
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1048576)  # 1MB receive buffer
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)  # 1MB send buffer
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4194304)  # 1MB receive buffer
         except:
             pass
 
@@ -165,7 +165,17 @@ class ReliableUDPClient:
                         if data == EOF_MARKER:
                             print("Received EOF marker")
                             eof_received = True
-                            # Send final ACK
+
+                            # CRITICAL FIX: Store EOF just like regular data, then update next_expected
+                            # This handles EOF arriving before all data packets
+                            if seq_num not in self.received_data:
+                                self.received_data[seq_num] = data
+
+                            # Update next_expected through all contiguous data including EOF
+                            while self.next_expected in self.received_data:
+                                self.next_expected += len(self.received_data[self.next_expected])
+
+                            # Send final ACK with correct next_expected
                             self.send_ack()
                             break
 
