@@ -1,0 +1,13 @@
+Connecting to server at 10.0.0.1:6555
+Sent file request (attempt 1/5)
+Receiving file...
+Received EOF marker at sequence 6463538
+Still waiting for data: next_expected=6460500, EOF at 6463538
+Received EOF marker at sequence 6463538
+Still waiting for data: next_expected=6460500, EOF at 6463538
+Received EOF marker at sequence 6463538
+Still waiting for data: next_expected=6460500, EOF at 6463538
+All data received after EOF, finishing...
+Received 5478 packets, 6463538 bytes
+File written to received_data.txt (6463538 bytes)
+File transfer completed successfully

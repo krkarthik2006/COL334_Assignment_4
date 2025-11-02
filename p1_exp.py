@@ -68,7 +68,7 @@ def run(expname):
     elif expname == "jitter":
         delay_list = [20]    
         loss_list = [1]     
-        jitter_list = [20, 40, 60, 80, 100]
+        jitter_list = [3000, 40, 60, 80, 100]
     else:
         print("Unknown experiment name. Use 'loss' or 'jitter'.")
         f_out.close()
@@ -101,10 +101,12 @@ def run(expname):
                     h2 = net.get('h2')
 
                     # Start server
-                    script_dir = "/app/projects/COL334_Assignment_4"
+                    script_dir = os.getcwd()  # Use current working directory instead of hardcoded Docker path
                     start_time = time.time()
-                    h1.cmd(f"cd {script_dir} && python3 p1_server.py {SERVER_IP} {SERVER_PORT} {SWS} > /tmp/server_{i}.log 2>&1 &")
-                    result = h2.cmd(f"cd {script_dir} && python3 p1_client.py {SERVER_IP} {SERVER_PORT}")
+                    # Start server and redirect logs - use -u flag for unbuffered output
+                    h1.cmd(f"cd {script_dir} && python3 -u p1_server.py {SERVER_IP} {SERVER_PORT} {SWS} > {script_dir}/server_{i}.log 2>&1 &")
+                    # Run client and capture its stdout/stderr - use -u flag for unbuffered output
+                    result = h2.cmd(f"cd {script_dir} && python3 -u p1_client.py {SERVER_IP} {SERVER_PORT} > {script_dir}/client_{i}.log 2>&1")
                     end_time = time.time()
                     ttc = end_time - start_time
                     print(f"Transfer completed in {ttc:.2f} seconds")

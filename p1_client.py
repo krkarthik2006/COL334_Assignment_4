@@ -139,12 +139,13 @@ class ReliableUDPClient:
         packets_received = 0
         total_bytes = 0
         eof_received = False
+        eof_seq_num = None  # Track the sequence number where EOF was received
         last_activity = time.time()
         stall_timeout = 3.0  # If no packets for 3 seconds, assume done
 
         print("Receiving file...")
 
-        while not eof_received:
+        while True:
             # Check for timeout (no activity)
             if time.time() - last_activity > stall_timeout:
                 print("Connection stalled, finishing...")
@@ -163,21 +164,29 @@ class ReliableUDPClient:
                     if seq_num is not None and data is not None:
                         # Check for EOF marker
                         if data == EOF_MARKER:
-                            print("Received EOF marker")
+                            print(f"Received EOF marker at sequence {seq_num}")
                             eof_received = True
+                            eof_seq_num = seq_num
 
-                            # CRITICAL FIX: Store EOF just like regular data, then update next_expected
-                            # This handles EOF arriving before all data packets
+                            # Store EOF marker in received_data
                             if seq_num not in self.received_data:
                                 self.received_data[seq_num] = data
 
-                            # Update next_expected through all contiguous data including EOF
+                            # Update next_expected through all contiguous data
                             while self.next_expected in self.received_data:
                                 self.next_expected += len(self.received_data[self.next_expected])
 
-                            # Send final ACK with correct next_expected
+                            # Send ACK
                             self.send_ack()
-                            break
+
+                            # Check if we've received all data before EOF
+                            if self.next_expected >= eof_seq_num:
+                                print("All data before EOF received, finishing...")
+                                break
+                            else:
+                                print(f"Still waiting for data: next_expected={self.next_expected}, EOF at {eof_seq_num}")
+                                # Continue receiving missing packets
+                                continue
 
                         # Store received data
                         if seq_num not in self.received_data:
@@ -189,6 +198,12 @@ class ReliableUDPClient:
                             # Update next_expected if we received the next in-order packet
                             while self.next_expected in self.received_data:
                                 self.next_expected += len(self.received_data[self.next_expected])
+
+                            # Check if we've received all data (if EOF was already received)
+                            if eof_received and eof_seq_num is not None and self.next_expected >= eof_seq_num:
+                                print("All data received after EOF, finishing...")
+                                self.send_ack()
+                                break
 
                             # ACK every packet immediately for best throughput in lossy conditions
                             # With 1-5% loss, aggressive ACKing helps server advance window faster
@@ -225,8 +240,12 @@ class ReliableUDPClient:
                 sorted_seqs = sorted(self.received_data.keys())
 
                 for seq in sorted_seqs:
+                    # Skip EOF marker - don't write it to the file
+                    data = self.received_data[seq]
+                    if data == EOF_MARKER:
+                        continue
+
                     if seq == current_seq:
-                        data = self.received_data[seq]
                         f.write(data)
                         current_seq += len(data)
                     elif seq > current_seq:
@@ -234,7 +253,6 @@ class ReliableUDPClient:
                         print(f"Warning: Gap detected at sequence {current_seq}, next is {seq}")
                         # Try to continue anyway
                         current_seq = seq
-                        data = self.received_data[seq]
                         f.write(data)
                         current_seq += len(data)
 

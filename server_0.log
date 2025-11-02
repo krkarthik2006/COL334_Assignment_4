@@ -1,0 +1,4 @@
+Server listening on 10.0.0.1:6555 with SWS=5900
+Received request from ('10.0.0.2', 34454)
+Sending file of size 6463538 bytes to ('10.0.0.2', 34454)
+File transfer complete. Total packets: 5484, Retransmissions: 5291
