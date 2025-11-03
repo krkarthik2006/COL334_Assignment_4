@@ -3,24 +3,28 @@ import sys
 import struct
 import time
 import select
+import csv
+from collections import deque
 
 # Constants
 MAX_PACKET_SIZE = 1200
 HEADER_SIZE = 20
 MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
 EOF_MARKER = b"EOF"
-INITIAL_TIMEOUT = 0.05
-TIMEOUT_MULTIPLIER = 1.5
-MAX_TIMEOUT = 1.0
+INITIAL_TIMEOUT = 0.1
+TIMEOUT_MULTIPLIER = 2.0
+MAX_TIMEOUT = 0.5  # Reduced from 2.0 to prevent death spiral
 MIN_TIMEOUT = 0.05
-SEND_BATCH_SIZE = 100  # Send packets in batches for better pipelining
+MAX_CWND = 200 * MAX_DATA_SIZE  # Cap cwnd at 200 MSS to prevent overshoot
+
+MSS = MAX_DATA_SIZE
 
 class ReliableUDPServer:
     def __init__(self, server_ip, server_port):
         self.server_ip = server_ip
         self.server_port = server_port
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
+        self.MSS = MSS
         # Increase socket buffer sizes for better performance
         try:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)  # 4MB send buffer
@@ -37,27 +41,90 @@ class ReliableUDPServer:
         self.rto = INITIAL_TIMEOUT  # Retransmission timeout
 
         # TCP CUBIC congestion control state
-        self.cwnd = 10 * MAX_DATA_SIZE  # Start at 10 MSS (modern TCP initial window)
-        self.ssthresh = 500 * MAX_DATA_SIZE  # Initial threshold (~2.5x BDP for 100Mbps/40ms)
+        self.cwnd = float(10 * MSS)  
+        self.ssthresh = float(1000 * MSS)  # Initial slow start threshold (effectively infinite)
 
-        # CUBIC specific variables
-        self.W_max = 0  # Window size before last reduction
-        self.K = 0  # Time period to reach W_max
-        self.epoch_start = None  # Time of last congestion event
-        self.tcp_cwnd = 10 * MAX_DATA_SIZE  # For TCP-friendly comparison
-        self.acked_bytes_count = 0  # Track ACKs for TCP-friendly mode
+        # CUBIC specific state
+        self.W_max = 0  # Window size at last congestion event (in MSS units)
+        self.K = 0  # Time period to reach W_max again (in seconds)
+        self.epoch_start = None  # Time when current epoch started
+        self.tcp_cwnd = float(self.cwnd)  # TCP-friendly window estimate
 
-        # CUBIC constants - tuned for 40ms RTT network
-        self.C = 1.0  # Scaling factor (increased from 0.4 for faster growth)
-        self.beta = 0.5  # Multiplicative decrease factor (TCP Reno-like for faster recovery)
-        self.tcp_friendliness = True  # Enable hybrid mode
+        # CUBIC parameters (RFC 8312)
+        self.C = 0.4  # CUBIC scaling constant
+        self.beta = 0.7  # Multiplicative decrease factor (CUBIC uses 0.7, TCP uses 0.5)
 
-        # Duplicate ACK tracking for fast retransmit
+        # Duplicate ACK tracking
         self.last_ack = 0
         self.dup_ack_count = 0
+        self.last_congestion_time = 0  # Prevent rapid congestion events
 
-        # Track when we last grew cwnd (for RTT-based growth in CA)
-        self.last_cwnd_growth_time = time.time()
+        # Logging and statistics
+        self.start_time = None
+        self.log_data = []
+        self.bytes_sent = 0
+        self.bytes_acked = 0
+        self.sending_rate_window = deque(maxlen=10)  # Track last 10 measurements
+        self.last_log_time = None
+
+    def log_state(self, event="periodic", extra_info=None):
+        """
+        Log current congestion control state for analysis.
+        Records: time, cwnd, ssthresh, mode, event, sending_rate, throughput
+        """
+        if self.start_time is None:
+            return
+
+        current_time = time.time() - self.start_time
+
+        # Determine mode
+        if self.cwnd < self.ssthresh:
+            mode = "slow_start"
+        else:
+            mode = "congestion_avoidance"
+
+        # Calculate sending rate (bytes/sec over recent window)
+        sending_rate = 0
+        if len(self.sending_rate_window) > 0:
+            total_sent = sum(b for b, _ in self.sending_rate_window)
+            time_span = self.sending_rate_window[-1][1] - self.sending_rate_window[0][1]
+            if time_span > 0:
+                sending_rate = total_sent / time_span
+
+        # Calculate throughput (acked bytes / time)
+        throughput = self.bytes_acked / current_time if current_time > 0 else 0
+
+        # Log entry
+        log_entry = {
+            'time': current_time,
+            'cwnd': self.cwnd,
+            'ssthresh': self.ssthresh,
+            'mode': mode,
+            'event': event,
+            'rto': self.rto,
+            'W_max': self.W_max,
+            'sending_rate': sending_rate,
+            'throughput': throughput,
+            'bytes_sent': self.bytes_sent,
+            'bytes_acked': self.bytes_acked,
+            'extra': extra_info or ''
+        }
+        self.log_data.append(log_entry)
+
+    def save_logs(self, filename='cubic_logs.csv'):
+        """Save logged data to CSV file for analysis."""
+        if not self.log_data:
+            return
+
+        fieldnames = ['time', 'cwnd', 'ssthresh', 'mode', 'event', 'rto', 'W_max',
+                      'sending_rate', 'throughput', 'bytes_sent', 'bytes_acked', 'extra']
+
+        with open(filename, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.log_data)
+
+        print(f"Logs saved to {filename}")
 
     def calculate_rto(self, sample_rtt):
         """Calculate RTO using TCP-style exponential weighted moving average"""
@@ -74,7 +141,7 @@ class ReliableUDPServer:
             self.rttvar = (1 - beta) * prev_rttvar + beta * abs(self.srtt - sample_rtt)
             self.srtt = (1 - alpha) * self.srtt + alpha * sample_rtt
 
-        # Calculate RTO with bounds - more aggressive for better throughput
+        # Calculate RTO per RFC 6298
         self.rto = self.srtt + 4 * self.rttvar
         if self.rto < MIN_TIMEOUT:
             self.rto = MIN_TIMEOUT
@@ -82,78 +149,134 @@ class ReliableUDPServer:
             self.rto = MAX_TIMEOUT
 
     def cubic_update(self, acked_bytes):
-        """Update cwnd using CUBIC algorithm - optimized for 40ms RTT"""
-
-        # Slow start phase - exponential growth
-        if self.cwnd < self.ssthresh:
-            self.cwnd += acked_bytes
-            # Keep tcp_cwnd in sync during slow start
-            self.tcp_cwnd = self.cwnd
+        """
+        Update cwnd using CUBIC algorithm per RFC 8312.
+        Called when new data is ACKed.
+        """
+        if acked_bytes <= 0:
             return
 
-        # Congestion avoidance - first time entering, initialize tcp_cwnd
-        if self.epoch_start is None:
-            self.epoch_start = time.time()
-            # Ensure tcp_cwnd is initialized to current cwnd
-            if self.tcp_cwnd < self.cwnd:
+        # Track acked bytes
+        self.bytes_acked += acked_bytes
+
+        # Slow start: exponential growth
+        if self.cwnd < self.ssthresh:
+            # In slow start, increase cwnd by acked_bytes
+            # This approximately doubles cwnd every RTT
+            old_cwnd = self.cwnd
+            self.cwnd += acked_bytes
+            self.tcp_cwnd = self.cwnd
+
+            # Cap cwnd to prevent overshoot
+            if self.cwnd > MAX_CWND:
+                self.cwnd = MAX_CWND
                 self.tcp_cwnd = self.cwnd
 
-        t = time.time() - self.epoch_start  # Time since last congestion
-
-        # Always calculate TCP Reno rate (for fairness)
-        self.acked_bytes_count += acked_bytes
-        if self.acked_bytes_count >= self.cwnd:
-            # TCP Reno: increase by 1 MSS per RTT
-            self.tcp_cwnd += MAX_DATA_SIZE
-            self.acked_bytes_count -= self.cwnd
-
-        # If no congestion yet, just use TCP Reno growth
-        if self.W_max == 0:
-            self.cwnd = self.tcp_cwnd
+            # Log if significant change (crossed MSS boundary)
+            if int(old_cwnd / MSS) < int(self.cwnd / MSS):
+                self.log_state(event="slow_start_growth", extra_info=f"cwnd: {old_cwnd:.0f} -> {self.cwnd:.0f}")
             return
 
-        # CUBIC: W(t) = C * (t - K)^3 + W_max
-        target = self.C * ((t - self.K) ** 3) + self.W_max
+        # Congestion avoidance: CUBIC growth
+        # Start a new epoch if needed
+        if self.epoch_start is None:
+            self.epoch_start = time.time()
+            # If no prior W_max (first time in CA), set to current window
+            if self.W_max == 0:
+                self.W_max = self.cwnd / MSS
+            # Calculate K: time to reach W_max
+            self.K = ((self.W_max * (1.0 - self.beta)) / self.C) ** (1.0 / 3.0)
+            # Initialize TCP-friendly window
+            self.tcp_cwnd = self.cwnd
+            # Log epoch start
+            self.log_state(event="epoch_start", extra_info=f"W_max={self.W_max:.2f}, K={self.K:.2f}s")
 
-        # Use max of CUBIC and TCP-friendly (ensures fairness with Reno)
-        if self.tcp_cwnd > target:
+        # Time since epoch start
+        t = time.time() - self.epoch_start
+
+        # CUBIC window: W_cubic(t) = C * (t - K)^3 + W_max (in MSS units)
+        target_mss = self.C * ((t - self.K) ** 3) + self.W_max
+        target_cwnd = target_mss * MSS  # convert to bytes
+
+        # TCP-friendly window (Reno estimate)
+        # Increment per ACK in CA: alpha * MSS / cwnd where alpha ~= 1
+        tcp_increment = acked_bytes * MSS / max(self.tcp_cwnd, MSS)
+        self.tcp_cwnd += tcp_increment
+
+        # CUBIC increment calculation
+        if target_cwnd > self.cwnd:
+            # Below target: ramp up using CUBIC
+            # cnt approximates how many ACKs needed to close the gap
+            cnt = self.cwnd / (target_cwnd - self.cwnd)
+            if cnt < 1:
+                cnt = 1
+            increment = acked_bytes / cnt
+        else:
+            # At or above target: use small additive increase
+            increment = acked_bytes * MSS / self.cwnd
+
+        # Use max(W_cubic, W_tcp) for TCP-friendliness
+        cwnd_cubic = self.cwnd + increment
+        if self.tcp_cwnd > cwnd_cubic:
             self.cwnd = self.tcp_cwnd
         else:
-            # Grow aggressively toward target
-            if target > self.cwnd:
-                # Calculate per-ACK increment
-                # More aggressive: grow by a fraction of the gap each RTT
-                gap = target - self.cwnd
-                increment = max(gap / 10.0, MAX_DATA_SIZE) / self.cwnd * acked_bytes
-                self.cwnd += increment
-            else:
-                # Near or past W_max, use standard additive increase
-                self.cwnd = self.tcp_cwnd
+            self.cwnd = cwnd_cubic
 
-        # Ensure cwnd stays reasonable
-        self.cwnd = max(self.cwnd, MAX_DATA_SIZE)
+        # Enforce window size limits
+        if self.cwnd < MSS:
+            self.cwnd = MSS
+        elif self.cwnd > MAX_CWND:
+            self.cwnd = MAX_CWND
+            self.tcp_cwnd = self.cwnd
 
 
-    def on_congestion_event(self):
-        """Handle congestion (timeout or 3 dup ACKs)"""
 
-        # Save current window as W_max
-        self.W_max = self.cwnd
+    def on_congestion_event(self, is_timeout=False):
+        """
+        Handle congestion event (packet loss) per RFC 8312.
+        Reduces window and records W_max.
+        is_timeout: If True, indicates timeout (more severe) vs fast retransmit
+        """
+        # Prevent multiple congestion responses within one RTT
+        current_time = time.time()
+        min_interval = self.srtt if self.srtt else 0.05  # Use estimated RTT or 50ms
 
-        # Multiplicative decrease by beta (0.5 = TCP Reno behavior)
-        self.cwnd = max(int(self.cwnd * self.beta), 2 * MAX_DATA_SIZE)
-        self.ssthresh = self.cwnd
+        if current_time - self.last_congestion_time < min_interval:
+            # Too soon after last congestion event, ignore
+            return
 
-        # Reset CUBIC epoch - calculate K (time to reach W_max)
-        if self.W_max > self.cwnd:
-            self.K = ((self.W_max - self.cwnd) / self.C) ** (1/3)
+        self.last_congestion_time = current_time
+
+        # Record window size before reduction (in MSS units)
+        old_cwnd = self.cwnd
+        self.W_max = self.cwnd / MSS
+
+        # Multiplicative decrease by beta
+        new_cwnd = max(self.cwnd * self.beta, 2 * MSS)
+
+        # Set ssthresh to the reduced window
+        self.ssthresh = max(new_cwnd, 2 * MSS)
+
+        # For timeout (severe congestion), reduce cwnd more to re-enter slow start
+        if is_timeout:
+            self.cwnd = max(new_cwnd * 0.5, 2 * MSS)  # Drop to 50% to ensure slow start
         else:
-            self.K = 0
-        self.epoch_start = None
+            self.cwnd = new_cwnd  # Fast retransmit: stay at same level
 
-        # Reset TCP-friendly tracking to current cwnd
+        # Calculate K: time to grow back to W_max
+        # K = cubic_root((W_max - W_max*beta) / C) = cubic_root((W_max * (1-beta)) / C)
+        if self.W_max > 0:
+            self.K = ((self.W_max * (1.0 - self.beta)) / self.C) ** (1.0 / 3.0)
+        else:
+            self.K = 0.0
+
+        # Start new epoch on next ACK
+        self.epoch_start = None
         self.tcp_cwnd = self.cwnd
-        self.acked_bytes_count = 0
+
+        # Log congestion event
+        self.log_state(event="congestion", extra_info=f"cwnd: {old_cwnd:.0f} -> {self.cwnd:.0f}, ssthresh: {self.ssthresh:.0f}")
+
 
     def create_packet(self, seq_num, data):
         """Create a packet with sequence number and data"""
@@ -182,7 +305,7 @@ class ReliableUDPServer:
         return ack_num, sack_blocks
 
     def send_file(self, client_addr):
-        """Send file using sliding window protocol with CUBIC congestion control"""
+        """Send file using sliding window protocol with TCP CUBIC congestion control"""
         # Get file size without reading entire file into memory
         try:
             import os
@@ -210,14 +333,18 @@ class ReliableUDPServer:
         self.last_ack = 0
         self.dup_ack_count = 0
 
-        while base <= total_size:
-            # Send new packets while window allows
-            packets_sent_in_batch = 0
+        # Initialize logging
+        self.start_time = time.time()
+        self.bytes_sent = 0
+        self.bytes_acked = 0
+        self.last_log_time = self.start_time
+        self.log_state(event="transfer_start", extra_info=f"file_size={total_size}")
 
+        while base <= total_size:
             # Calculate in-flight bytes
             in_flight = next_seq - base
 
-            # Send as much as cwnd allows, but pause periodically to check ACKs
+            # Send new packets to fill the entire congestion window
             while next_seq < total_size and in_flight < self.cwnd:
                 # Read chunk of data from file on-demand
                 chunk_start = next_seq
@@ -231,19 +358,18 @@ class ReliableUDPServer:
                 packet = self.create_packet(next_seq, data)
                 self.socket.sendto(packet, client_addr)
 
+                # Track bytes sent for rate calculation
+                bytes_in_packet = len(data)
+                self.bytes_sent += bytes_in_packet
+                self.sending_rate_window.append((bytes_in_packet, time.time()))
+
                 # Store packet info for potential retransmission
                 window_packets[next_seq] = (packet, time.time(), 0)
                 next_seq = chunk_end
                 total_packets_sent += 1
-                packets_sent_in_batch += 1
 
                 # Update in-flight bytes
                 in_flight = next_seq - base
-
-                # Only pause to check ACKs after sending a batch
-                # This prevents CPU monopolization while maintaining high throughput
-                if packets_sent_in_batch >= SEND_BATCH_SIZE:
-                    break
 
             # Send EOF packet after all data is sent
             if next_seq == total_size and total_size not in window_packets:
@@ -255,30 +381,27 @@ class ReliableUDPServer:
             # Calculate in-flight bytes
             in_flight = next_seq - base
 
-            # Determine if we should wait for ACKs or continue sending
-            # Only wait if: (1) window is full OR (2) all data sent
+            # Determine timeout for waiting for ACKs
+            # Wait if window is full or all data sent
             window_full = in_flight >= self.cwnd
             all_data_sent = next_seq >= total_size
 
             if window_full or all_data_sent:
                 # Window is full or nothing more to send - wait for ACKs
-                timeout = 0.001  # Default short timeout
-
                 if base in window_packets:
-                    # Get the send time of the OLDEST unacked packet
                     base_send_time = window_packets[base][1]
                     elapsed = time.time() - base_send_time
-                    # Calculate time remaining until timeout
                     timeout = max(0.001, self.rto - elapsed)
-
+                else:
+                    timeout = 0.001
                 ready = select.select([self.socket], [], [], timeout)
             else:
-                # Window has space and more data to send - check for ACKs without blocking
-                ready = select.select([self.socket], [], [], 0.0001)  # 0.1ms timeout
+                # Window has space - check for ACKs without blocking
+                ready = select.select([self.socket], [], [], 0)
 
             if ready[0]:
-                # Receive all available ACKs (non-blocking)
-                for _ in range(100):  # Process up to 100 ACKs per iteration
+                # Receive all available ACKs
+                for _ in range(100):
                     try:
                         ack_packet, _ = self.socket.recvfrom(MAX_PACKET_SIZE)
                         recv_time = time.time()
@@ -299,6 +422,12 @@ class ReliableUDPServer:
                                         sample_rtt = recv_time - send_time
                                         self.calculate_rto(sample_rtt)
 
+                                # On successful ACK, gradually reduce RTO if it's significantly backed off
+                                # But don't do this too aggressively to avoid RTO oscillations
+                                calculated_rto = (self.srtt + 4 * self.rttvar) if self.srtt else MIN_TIMEOUT
+                                if self.rto > calculated_rto * 1.5:  # Only if RTO is 50% higher than calculated
+                                    self.rto = max(self.rto * 0.9, calculated_rto)  # Reduce slowly
+
                                 # Update CUBIC window
                                 self.cubic_update(acked_bytes)
 
@@ -312,20 +441,26 @@ class ReliableUDPServer:
                                 self.dup_ack_count = 0
 
                             elif ack_num == self.last_ack and ack_num > 0:
-                                # Duplicate ACK - increment counter
-                                self.dup_ack_count += 1
+                                # Duplicate ACK - only count if we have unacked data beyond this point
+                                # This prevents false positives from over-eager client ACKs
+                                if next_seq > ack_num:
+                                    self.dup_ack_count += 1
 
-                                # Fast retransmit on 3 duplicate ACKs
-                                if self.dup_ack_count == 3:
-                                    # Congestion event
-                                    self.on_congestion_event()
+                                    # Fast retransmit on 3 duplicate ACKs
+                                    if self.dup_ack_count == 3:
+                                        # Congestion event
+                                        self.on_congestion_event()
+                                        self.log_state(event="fast_retransmit", extra_info=f"dup_acks=3, seq={base}")
 
-                                    # Retransmit lost packet
-                                    if base in window_packets:
-                                        packet, _, retrans_count = window_packets[base]
-                                        self.socket.sendto(packet, client_addr)
-                                        window_packets[base] = (packet, time.time(), retrans_count + 1)
-                                        retransmissions += 1
+                                        # Retransmit lost packet
+                                        if base in window_packets:
+                                            packet, _, retrans_count = window_packets[base]
+                                            self.socket.sendto(packet, client_addr)
+                                            window_packets[base] = (packet, time.time(), retrans_count + 1)
+                                            retransmissions += 1
+
+                                        # Reset dup_ack_count after fast retransmit
+                                        self.dup_ack_count = 0
 
                             # Handle SACK blocks if present - selective retransmission
                             if sack_blocks:
@@ -337,47 +472,72 @@ class ReliableUDPServer:
                                             del window_packets[seq]
 
                                 # Proactively retransmit gaps - all holes up to max SACK end
+                                # But limit retransmissions to prevent storms
                                 if base in window_packets and sack_blocks:
                                     max_sack_end = max(end for _, end in sack_blocks)
-                                    # Find and retransmit ALL missing packets (not covered by SACK)
+                                    min_retrans_interval = self.srtt if self.srtt else 0.05
+                                    retrans_this_ack = 0
+                                    max_retrans_per_ack = 5  # Limit retransmissions per ACK
+
+                                    # Find and retransmit missing packets (not covered by SACK)
                                     for seq in list(window_packets.keys()):
-                                        if base < seq < max_sack_end:
+                                        if base < seq < max_sack_end and retrans_this_ack < max_retrans_per_ack:
                                             # Check if this seq is covered by any SACK block
                                             is_sacked = any(start <= seq < end for start, end in sack_blocks)
                                             if not is_sacked:
                                                 packet, send_time, retrans_count = window_packets[seq]
-                                                # Immediate retransmission of gaps
-                                                self.socket.sendto(packet, client_addr)
-                                                window_packets[seq] = (packet, now, retrans_count + 1)
-                                                retransmissions += 1
+                                                # Only retransmit if enough time has passed since last send
+                                                if now - send_time > min_retrans_interval:
+                                                    self.socket.sendto(packet, client_addr)
+                                                    window_packets[seq] = (packet, now, retrans_count + 1)
+                                                    retransmissions += 1
+                                                    retrans_this_ack += 1
                     except socket.error:
                         # No more ACKs available
                         break
 
             # Handle timeout - retransmit oldest unacknowledged packet
-            if window_packets:
+            if window_packets and base in window_packets:
                 current_time = time.time()
-                # Only check the base packet for timeout (Go-Back-N style)
-                if base in window_packets:
-                    packet, send_time, retrans_count = window_packets[base]
-                    if current_time - send_time > self.rto:
-                        # Congestion event
-                        self.on_congestion_event()
+                packet, send_time, retrans_count = window_packets[base]
+                if current_time - send_time > self.rto:
+                    # Congestion event (timeout is severe)
+                    self.on_congestion_event(is_timeout=True)
+                    self.log_state(event="timeout", extra_info=f"seq={base}, rto={self.rto:.3f}s")
 
-                        # Retransmit packet
-                        self.socket.sendto(packet, client_addr)
-                        window_packets[base] = (packet, current_time, retrans_count + 1)
-                        retransmissions += 1
+                    # Retransmit packet
+                    self.socket.sendto(packet, client_addr)
+                    window_packets[base] = (packet, current_time, retrans_count + 1)
+                    retransmissions += 1
 
-                        # Mild exponential backoff
-                        if retrans_count >= 2:
-                            self.rto = min(MAX_TIMEOUT, self.rto * TIMEOUT_MULTIPLIER)
+                    # Exponential backoff on every timeout
+                    self.rto = min(MAX_TIMEOUT, self.rto * TIMEOUT_MULTIPLIER)
+
+            # Periodic logging (every 0.1 seconds)
+            current_time = time.time()
+            if current_time - self.last_log_time >= 0.1:
+                self.log_state(event="periodic")
+                self.last_log_time = current_time
 
         # Close file handle
         file_handle.close()
 
-        print(f"File transfer complete. Total packets: {total_packets_sent}, Retransmissions: {retransmissions}")
+        # Log transfer completion
+        self.log_state(event="transfer_complete", extra_info=f"packets={total_packets_sent}, retrans={retransmissions}")
+
+        # Save logs to CSV
+        self.save_logs('cubic_logs.csv')
+
+        # Print statistics
+        transfer_time = time.time() - self.start_time
+        avg_throughput = self.bytes_acked / transfer_time if transfer_time > 0 else 0
+        print(f"\n=== Transfer Complete ===")
+        print(f"Total packets: {total_packets_sent}, Retransmissions: {retransmissions}")
+        print(f"Transfer time: {transfer_time:.2f}s")
+        print(f"Bytes sent: {self.bytes_sent}, Bytes acked: {self.bytes_acked}")
+        print(f"Average throughput: {avg_throughput/1024:.2f} KB/s")
         print(f"Final cwnd: {self.cwnd:.2f} bytes ({self.cwnd/MAX_DATA_SIZE:.2f} MSS)")
+        print(f"Logs saved to cubic_logs.csv")
 
     def run(self):
         """Main server loop"""

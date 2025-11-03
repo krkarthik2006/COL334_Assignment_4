@@ -152,7 +152,7 @@ class ReliableUDPClient:
                 print("Connection stalled, finishing...")
                 break
 
-            # Receive packets - very short timeout for better responsiveness
+            # Receive packets
             ready = select.select([self.socket], [], [], 0.01)
 
             if ready[0]:
@@ -206,20 +206,19 @@ class ReliableUDPClient:
                                 self.send_ack()
                                 break
 
-                            # ACK every packet immediately for best throughput in lossy conditions
-                            # With 1-5% loss, aggressive ACKing helps server advance window faster
+                            # ACK every packet immediately
                             self.send_ack()
                         else:
-                            # Duplicate packet - send ACK immediately (helps server)
+                            # Duplicate packet - send ACK immediately
                             self.send_ack()
 
                 except socket.error:
                     pass
 
             # Send periodic ACKs even if no new packets (duplicate ACKs for reliability)
-            # Very fast periodic ACKs for low latency
+            # But don't send too frequently to avoid overwhelming server
             current_time = time.time()
-            if current_time - self.last_ack_sent_time >= 0.01:  # At least every 10ms
+            if current_time - self.last_ack_sent_time >= 0.05:  # At least every 50ms
                 self.send_ack()
 
         # Send final ACKs to ensure server knows we're done - minimal overhead
