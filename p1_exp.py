@@ -68,7 +68,7 @@ def run(expname):
     elif expname == "jitter":
         delay_list = [20]    
         loss_list = [1]     
-        jitter_list = [3000, 40, 60, 80, 100]
+        jitter_list = [20, 40, 60, 80, 100]
     else:
         print("Unknown experiment name. Use 'loss' or 'jitter'.")
         f_out.close()
