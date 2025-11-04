@@ -11,11 +11,11 @@ MAX_PACKET_SIZE = 1200
 HEADER_SIZE = 20
 MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
 EOF_MARKER = b"EOF"
-INITIAL_TIMEOUT = 0.1
+INITIAL_TIMEOUT = 0.2
 TIMEOUT_MULTIPLIER = 2.0
-MAX_TIMEOUT = 0.5  # Reduced from 2.0 to prevent death spiral
-MIN_TIMEOUT = 0.05
-MAX_CWND = 2000 * MAX_DATA_SIZE  # Cap cwnd at 2000 MSS (allow proper growth)
+MAX_TIMEOUT = 3.0  # Allow proper exponential backoff
+MIN_TIMEOUT = 0.1
+MAX_CWND = 1000 * MAX_DATA_SIZE  # Cap cwnd at 500 MSS to prevent overwhelming network
 
 MSS = MAX_DATA_SIZE
 
@@ -42,7 +42,7 @@ class ReliableUDPServer:
 
         # TCP CUBIC congestion control state
         self.cwnd = float(1 * MSS)  # Start with 1 MSS acc to assgn constraints
-        self.ssthresh = float(64 * MSS)  # Lower ssthresh to reach CA faster and test CUBIC
+        self.ssthresh = float(16 * MSS)  # Target: reach 64 MSS in slow start, then CUBIC takes over
 
         # CUBIC specific state
         self.W_max = 0  # Window size at last congestion event (in MSS units)
@@ -67,10 +67,7 @@ class ReliableUDPServer:
         self.sending_rate_window = deque(maxlen=10)  # Track last 10 measurements
         self.last_log_time = None
 
-        # Pacing mechanism to prevent bursts
-        self.last_send_time = 0
-        self.min_send_interval = 0.00005  # Minimum 0.05ms between packets (prevents CPU-speed bursts)
-        self.target_rate = None  # Target sending rate in bytes/sec (estimated from cwnd/RTT)
+        # No pacing - send as fast as cwnd allows
 
     def log_state(self, event="periodic", extra_info=None):
         """
@@ -153,31 +150,6 @@ class ReliableUDPServer:
         elif self.rto > MAX_TIMEOUT:
             self.rto = MAX_TIMEOUT
 
-    def calculate_pacing_interval(self):
-        """
-        Calculate inter-packet delay for pacing based on cwnd and RTT.
-        Pacing prevents bursts and spreads packets evenly over the RTT.
-        Target rate = cwnd / RTT (bytes per second)
-        Interval = MSS / target_rate (seconds per packet)
-        """
-        if self.srtt is None or self.srtt <= 0:
-            # No RTT estimate yet - use minimal pacing
-            return self.min_send_interval  # 0.1ms between packets initially
-
-        # Calculate target sending rate: cwnd / RTT
-        # This ensures we send one window worth of data per RTT
-        target_rate = self.cwnd / self.srtt  # bytes/sec
-
-        # Calculate interval between packets
-        # We send MSS bytes per packet, so interval = MSS / rate
-        pacing_interval = MSS / target_rate
-
-        # Apply bounds: not too fast (min_send_interval) and not too slow (5ms max)
-        # Reduced max from 10ms to 5ms for better throughput
-        pacing_interval = max(self.min_send_interval, min(pacing_interval, 0.005))
-
-        return pacing_interval
-
     def cubic_update(self, acked_bytes):
         """
         Update cwnd using CUBIC algorithm per RFC 8312.
@@ -189,12 +161,12 @@ class ReliableUDPServer:
         # Track acked bytes
         self.bytes_acked += acked_bytes
 
-        # Slow start: exponential growth
+        # Slow start: controlled growth (slower than standard TCP)
         if self.cwnd < self.ssthresh:
-            # In slow start, increase cwnd by acked_bytes
-            # This approximately doubles cwnd every RTT (standard TCP behavior)
+            # Slower growth: increase by 50% per RTT instead of doubling
+            # This gives more controlled ramp-up to avoid overwhelming network
             old_cwnd = self.cwnd
-            self.cwnd += acked_bytes
+            self.cwnd += acked_bytes * 0.5  # 50% increase per RTT
             self.tcp_cwnd = self.cwnd
 
             # Cap cwnd at maximum
@@ -205,6 +177,19 @@ class ReliableUDPServer:
             # Log if significant change (crossed MSS boundary)
             if int(old_cwnd / MSS) < int(self.cwnd / MSS):
                 self.log_state(event="slow_start_growth", extra_info=f"cwnd: {old_cwnd:.0f} -> {self.cwnd:.0f}")
+            return
+        
+        if self.W_max == 0:
+            # Reno's Additive Increase: increment by ~1 MSS per RTT
+            tcp_increment = acked_bytes * MSS / max(self.cwnd, MSS)
+            self.cwnd += tcp_increment
+            self.tcp_cwnd = self.cwnd  # Keep tcp_cwnd in sync
+
+            # Enforce window size limits
+            if self.cwnd > MAX_CWND:
+                self.cwnd = MAX_CWND
+                self.tcp_cwnd = self.cwnd
+            
             return
 
         # Congestion avoidance: CUBIC growth
@@ -369,60 +354,41 @@ class ReliableUDPServer:
         self.bytes_acked = 0
         self.last_log_time = self.start_time
         self.log_state(event="transfer_start", extra_info=f"file_size={total_size}")
-
+        max_burst_packets = 3
+        pacer_timeout = 0.00113
         while base <= total_size:
             # Calculate in-flight bytes
             in_flight = next_seq - base
-
-            # Calculate pacing interval based on current cwnd and RTT
-            pacing_interval = self.calculate_pacing_interval()
-
-            # In slow start, use more aggressive (shorter) pacing to probe bandwidth faster
-            # Multiply by 0.5 to send twice as fast during slow start
-            if self.cwnd < self.ssthresh:
-                pacing_interval *= 0.5
-
-            # Send new packets with pacing to fill congestion window gradually
-            # Add inter-packet delay to prevent bursts, but allow enough packets per iteration
-            packets_sent_this_iter = 0
-            # Allow up to cwnd/MSS packets per iteration (fill entire window if needed)
-            max_packets_per_iter = max(50, int(self.cwnd / MSS))  # At least 50, or full window
-
-            while next_seq < total_size and in_flight < self.cwnd and packets_sent_this_iter < max_packets_per_iter:
-                # PACING: Wait before sending if we sent too recently
+            packets_in_this_loop = 0
+            # Send packets to fill the congestion window
+            # No artificial delays - just controlled by cwnd growth rate
+            while next_seq < total_size and in_flight < self.cwnd and packets_in_this_loop < max_burst_packets:
                 current_time = time.time()
-                time_since_last_send = current_time - self.last_send_time
-                if time_since_last_send < pacing_interval:
-                    # Need to wait before sending next packet
-                    time.sleep(pacing_interval - time_since_last_send)
-                    current_time = time.time()
 
                 # Read chunk of data from file on-demand
                 chunk_start = next_seq
                 chunk_end = min(next_seq + MAX_DATA_SIZE, total_size)
 
-                # Seek to position and read chunk
                 file_handle.seek(chunk_start)
                 data = file_handle.read(chunk_end - chunk_start)
 
                 # Create and send packet
                 packet = self.create_packet(next_seq, data)
                 self.socket.sendto(packet, client_addr)
-                self.last_send_time = current_time  # Record send time for pacing
 
-                # Track bytes sent for rate calculation
+                # Track bytes sent
                 bytes_in_packet = len(data)
                 self.bytes_sent += bytes_in_packet
                 self.sending_rate_window.append((bytes_in_packet, time.time()))
 
-                # Store packet info for potential retransmission
+                # Store packet info
                 window_packets[next_seq] = (packet, current_time, 0)
                 next_seq = chunk_end
                 total_packets_sent += 1
-                packets_sent_this_iter += 1  # Track packets sent this iteration
 
-                # Update in-flight bytes
+                # Update in-flight for next iteration
                 in_flight = next_seq - base
+                packets_in_this_loop += 1
 
             # Send EOF packet after all data is sent
             if next_seq == total_size and total_size not in window_packets:
@@ -434,10 +400,9 @@ class ReliableUDPServer:
             # Calculate in-flight bytes
             in_flight = next_seq - base
 
-            # CRITICAL FIX: Always use short timeout to ensure responsive ACK processing
-            # This prevents blocking and allows quick reaction to ACKs
-            # Using 1ms timeout ensures we process ACKs quickly while not busy-waiting
-            ready = select.select([self.socket], [], [], 0.001)
+            # Use balanced timeout for ACK processing
+            # Balance between responsiveness and CPU usage
+            ready = select.select([self.socket], [], [], pacer_timeout)  # 1ms timeout
 
             if ready[0]:
                 # Receive all available ACKs
