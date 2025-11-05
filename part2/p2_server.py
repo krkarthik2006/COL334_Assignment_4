@@ -52,9 +52,9 @@ class ReliableUDPServer:
         self.epoch_start = None
         self.tcp_cwnd = float(self.cwnd)
 
-        # CUBIC parameters (RFC 8312)
-        self.C = 0.25
-        self.beta = 0.95
+
+        self.C = 0.3
+        self.beta = 0.99
 
         # Duplicate ACK tracking
         self.last_ack = 0
