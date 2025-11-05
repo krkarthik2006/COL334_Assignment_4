@@ -53,8 +53,8 @@ class ReliableUDPServer:
         self.tcp_cwnd = float(self.cwnd)
 
         # CUBIC parameters (RFC 8312)
-        self.C = 0.4
-        self.beta = 0.9
+        self.C = 0.25
+        self.beta = 0.95
 
         # Duplicate ACK tracking
         self.last_ack = 0

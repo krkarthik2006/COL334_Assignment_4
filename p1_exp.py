@@ -55,14 +55,14 @@ def run(expname):
 
     SERVER_IP = "10.0.0.1"
     SERVER_PORT = 6555
-    SWS = 5*1180
+    SWS = 5 * 1180
             
-    NUM_ITERATIONS = 1
+    NUM_ITERATIONS = 5 
     OUTFILE = 'received_data.txt'
     delay_list, loss_list, jitter_list = [], [], []
 
     if expname == "loss":
-        loss_list = [x for x in range(5,0,-1)]
+        loss_list = [x for x in range(1,6)]
         delay_list = [20]     
         jitter_list = [0]   
     elif expname == "jitter":
@@ -80,9 +80,7 @@ def run(expname):
         for DELAY in delay_list:
             for JITTER in jitter_list:
                 for i in range(0, NUM_ITERATIONS):
-                    print(f"\n{'='*60}")
-                    print(f"Running: Loss={LOSS}%, Delay={DELAY}ms, Jitter={JITTER}ms, Iteration {i+1}/{NUM_ITERATIONS}")
-                    print(f"{'='*60}")
+                    print(f"\n--- Running topology with {LOSS}% packet loss, base delay {DELAY}ms and jitter {JITTER}ms (iter {i+1}/{NUM_ITERATIONS})")
 
                     # Create the custom topology with the specified loss, delay and jitter
                     topo = CustomTopo(loss=LOSS, delay=DELAY, jitter=JITTER)
@@ -100,24 +98,17 @@ def run(expname):
                     h1 = net.get('h1')
                     h2 = net.get('h2')
 
-                    # Start server
-                    script_dir = os.getcwd()  # Use current working directory instead of hardcoded Docker path
                     start_time = time.time()
-                    # Start server and redirect logs - use -u flag for unbuffered output
-                    h1.cmd(f"cd {script_dir} && python3 -u p1_server.py {SERVER_IP} {SERVER_PORT} {SWS} > {script_dir}/server_{i}.log 2>&1 &")
-                    # Run client and capture its stdout/stderr - use -u flag for unbuffered output
-                    result = h2.cmd(f"cd {script_dir} && python3 -u p1_client.py {SERVER_IP} {SERVER_PORT} > {script_dir}/client_{i}.log 2>&1")
+                    
+                    h1.cmd(f"python3 p1_server.py {SERVER_IP} {SERVER_PORT} {SWS} &")
+                    time.sleep(1)
+                    result = h2.cmd(f"python3 p1_client.py {SERVER_IP} {SERVER_PORT}")
                     end_time = time.time()
                     ttc = end_time - start_time
-                    print(f"Transfer completed in {ttc:.2f} seconds")
 
-                    md5_hash = compute_md5(f"{script_dir}/{OUTFILE}")
+                    md5_hash = compute_md5(OUTFILE)
                     # write the result to a file
                     f_out.write(f"{i},{LOSS},{DELAY},{JITTER},{md5_hash},{ttc}\n")
-                    f_out.flush()  # Ensure data is written to disk
-
-                    # Clean up: kill any remaining server processes
-                    h1.cmd("killall -9 python3 2>/dev/null")
 
                     # Stop the network
                     net.stop()
