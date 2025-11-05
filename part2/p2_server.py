@@ -54,7 +54,7 @@ class ReliableUDPServer:
 
         # CUBIC parameters (RFC 8312)
         self.C = 0.4
-        self.beta = 0.7
+        self.beta = 0.9
 
         # Duplicate ACK tracking
         self.last_ack = 0
@@ -308,7 +308,7 @@ class ReliableUDPServer:
         self.log_state(event="transfer_start", extra_info=f"file_size={total_size}")
 
         # OPTIMIZATION 2 & 3: Remove burst limit and reduce pacer interval
-        max_burst_packets = 500  # Increased from 15 to 500
+        max_burst_packets = 20  # Increased from 15 to 500
         pacer_interval = 0.00001  # Reduced from 0.001 to 0.00001 (10μs)
 
         while base <= total_size:
@@ -355,7 +355,7 @@ class ReliableUDPServer:
 
             if ready[0]:
                 # Process more ACKs per iteration
-                for _ in range(200):  # Increased from 100 to 200
+                for _ in range(10):  # Increased from 100 to 200
                     try:
                         ack_packet, _ = self.socket.recvfrom(MAX_PACKET_SIZE)
                         recv_time = time.time()
