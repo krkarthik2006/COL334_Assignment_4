@@ -22,15 +22,15 @@ class ReliableUDPClient:
 
         # Increase socket buffer sizes for better performance
         try:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)  # 4MB send buffer
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4194304)  # 4MB receive buffer
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)  # 8MB send buffer
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608)  # 8MB receive buffer
         except:
             pass
 
         self.socket.settimeout(REQUEST_TIMEOUT)
 
         # Receiver state
-        self.received_data = {}  # {seq_num: data}
+        self.received_data = {}  # {seq_num: data} -> NOW ONLY FOR OUT-OF-ORDER
         self.next_expected = 0  # Next expected sequence number (for cumulative ACK)
         self.last_ack_sent_time = 0
         self.packets_since_ack = 0  # Counter for delayed ACK optimization
@@ -74,7 +74,7 @@ class ReliableUDPClient:
         i = 0
         while i < len(sorted_seqs):
             seq = sorted_seqs[i]
-            if seq <= self.next_expected:
+            if seq < self.next_expected: # Note: changed from <=
                 i += 1
                 continue
 
@@ -128,152 +128,150 @@ class ReliableUDPClient:
         return False
 
     def receive_file(self):
-        """Receive file from server using sliding window protocol"""
-        # Send initial request
+        """
+        Receive file from server using sliding window protocol.
+        Writes in-order data directly to disk.
+        """
         if not self.request_file():
             return False
 
-        # Set socket to non-blocking for better control
         self.socket.setblocking(False)
 
-        # Statistics
         packets_received = 0
         total_bytes = 0
         eof_received = False
-        eof_seq_num = None  # Track the sequence number where EOF was received
+        eof_seq_num = None
         last_activity = time.time()
-        stall_timeout = 3.0  # If no packets for 3 seconds, assume done
+        stall_timeout = 3.0 # If no packets for 3 seconds, assume done
 
-        print("Receiving file...")
+        output_filename = f"{self.pref_filename}received_data.txt"
 
-        while True:
-            # Check for timeout (no activity)
-            if time.time() - last_activity > stall_timeout:
-                print("Connection stalled, finishing...")
-                break
+        try:
+            with open(output_filename, 'wb') as file_handle:
+                print("Receiving file...")
 
-            # Receive packets
-            ready = select.select([self.socket], [], [], 0.01)
+                while True:
+                    if time.time() - last_activity > stall_timeout:
+                        if eof_received and self.next_expected == eof_seq_num:
+                            print("Stall timeout after EOF, transfer complete.")
+                        else:
+                            print(f"Connection stalled, timeout. next_expected={self.next_expected}, eof_seq_num={eof_seq_num}")
+                        break # Exit main loop on stall
 
-            if ready[0]:
-                try:
-                    packet, _ = self.socket.recvfrom(MAX_PACKET_SIZE)
-                    last_activity = time.time()
+                    ready = select.select([self.socket], [], [], 0.01)
 
-                    seq_num, data = self.parse_packet(packet)
+                    if not ready[0]:
+                        # No packets, check if we need to send a periodic ACK
+                        current_time = time.time()
+                        if current_time - self.last_ack_sent_time >= 0.05: # At least every 50ms
+                            self.send_ack()
+                        continue
 
-                    if seq_num is not None and data is not None:
-                        # Check for EOF marker
+                    # Packets are ready
+                    try:
+                        packet, _ = self.socket.recvfrom(MAX_PACKET_SIZE)
+                        last_activity = time.time()
+                        seq_num, data = self.parse_packet(packet)
+
+                        if seq_num is None or data is None:
+                            continue # Corrupt packet
+
+                        # --- EOF Packet Logic ---
                         if data == EOF_MARKER:
                             print(f"Received EOF marker at sequence {seq_num}")
                             eof_received = True
                             eof_seq_num = seq_num
-
-                            # Store EOF marker in received_data
-                            if seq_num not in self.received_data:
-                                self.received_data[seq_num] = data
-
-                            # Update next_expected through all contiguous data
-                            while self.next_expected in self.received_data:
-                                self.next_expected += len(self.received_data[self.next_expected])
-
-                            # Send ACK
-                            self.send_ack()
-
-                            # Check if we've received all data before EOF
-                            if self.next_expected >= eof_seq_num:
-                                print("All data before EOF received, finishing...")
-                                break
+                            if seq_num == self.next_expected:
+                                # EOF arrived perfectly in order. We are done.
+                                print("EOF received in order. Finishing.")
+                                self.send_ack() # Send final ACK
+                                break # Exit main loop
                             else:
-                                print(f"Still waiting for data: next_expected={self.next_expected}, EOF at {eof_seq_num}")
-                                # Continue receiving missing packets
+                                # EOF arrived out of order. Send ACK and wait for missing data.
+                                self.send_ack()
                                 continue
 
-                        # Store received data
-                        if seq_num not in self.received_data:
-                            self.received_data[seq_num] = data
+                        # --- Regular Data Packet Logic ---
+                        
+                        # 1. If packet is out of order (in the future)
+                        if seq_num > self.next_expected:
+                            if seq_num not in self.received_data:
+                                # Buffer out-of-order packet
+                                self.received_data[seq_num] = data
+                                packets_received += 1
+                                total_bytes += len(data)
+                            self.send_ack() # Send SACK for this packet
+                            continue
+
+                        # 2. If packet is in-order (seq_num == self.next_expected)
+                        if seq_num == self.next_expected:
+                            # Write this packet's data directly to disk
+                            file_handle.write(data)
+                            self.next_expected += len(data)
                             packets_received += 1
                             total_bytes += len(data)
-                            self.packets_since_ack += 1
 
-                            # Update next_expected if we received the next in-order packet
+                            # 3. Check buffer for contiguous packets
+                            # This loop "unlocks" buffered packets
                             while self.next_expected in self.received_data:
-                                self.next_expected += len(self.received_data[self.next_expected])
+                                buffered_data = self.received_data.pop(self.next_expected)
+                                file_handle.write(buffered_data)
+                                self.next_expected += len(buffered_data)
+                            
+                            self.send_ack() # Send cumulative ACK
 
-                            # Check if we've received all data (if EOF was already received)
-                            if eof_received and eof_seq_num is not None and self.next_expected >= eof_seq_num:
+                            # 4. Check for completion
+                            if eof_received and self.next_expected == eof_seq_num:
                                 print("All data received after EOF, finishing...")
-                                self.send_ack()
-                                break
+                                break # Exit main loop
+                        
+                        # 5. If packet is a duplicate (in the past)
+                        elif seq_num < self.next_expected:
+                            self.send_ack() # Re-send last cumulative ACK
 
-                            # ACK every packet immediately
-                            self.send_ack()
-                        else:
-                            # Duplicate packet - send ACK immediately
-                            self.send_ack()
+                    except socket.error:
+                        pass # No more packets to read for now
 
-                except socket.error:
-                    pass
+        except Exception as e:
+            print(f"Error during file receive or write: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # After loop breaks (finish or stall)
+        print(f"Received {packets_received} packets, {total_bytes} bytes")
+        print(f"File written to {output_filename} ({self.next_expected} bytes)")
 
-            # Send periodic ACKs even if no new packets (duplicate ACKs for reliability)
-            # But don't send too frequently to avoid overwhelming server
-            current_time = time.time()
-            if current_time - self.last_ack_sent_time >= 0.05:  # At least every 50ms
-                self.send_ack()
-
-        # Send final ACKs to ensure server knows we're done - minimal overhead
+        # Send final ACKs to ensure server knows we're done
         self.send_ack()
         time.sleep(0.01)
         self.send_ack()
-
-        print(f"Received {packets_received} packets, {total_bytes} bytes")
-
-        # Write received data to file in order
-        return self.write_file()
+        
+        # Check if we finished successfully
+        if eof_received and self.next_expected == eof_seq_num:
+            return True
+        else:
+            print(f"Transfer incomplete. EOF received: {eof_received}. Next expected: {self.next_expected}. EOF sequence: {eof_seq_num}")
+            return False
 
     def write_file(self):
-        """Write received data to file in correct order"""
-        try:
-            output_filename = f"{self.pref_filename}received_data.txt"
-            with open(output_filename, 'wb') as f:
-                # Write data in sequence number order
-                current_seq = 0
-                sorted_seqs = sorted(self.received_data.keys())
-
-                for seq in sorted_seqs:
-                    # Skip EOF marker - don't write it to the file
-                    data = self.received_data[seq]
-                    if data == EOF_MARKER:
-                        continue
-
-                    if seq == current_seq:
-                        f.write(data)
-                        current_seq += len(data)
-                    elif seq > current_seq:
-                        # Gap detected - this shouldn't happen if protocol works correctly
-                        print(f"Warning: Gap detected at sequence {current_seq}, next is {seq}")
-                        # Try to continue anyway
-                        current_seq = seq
-                        f.write(data)
-                        current_seq += len(data)
-
-            print(f"File written to {output_filename} ({current_seq} bytes)")
-            return True
-
-        except Exception as e:
-            print(f"Error writing file: {e}")
-            return False
+        """
+        This function is no longer used.
+        File writing is now handled directly in receive_file().
+        """
+        print("Note: write_file() is deprecated.")
+        pass
 
     def run(self):
         """Main client execution"""
         print(f"Connecting to server at {self.server_ip}:{self.server_port}")
-
+        success = False
         try:
             success = self.receive_file()
             if success:
                 print("File transfer completed successfully")
             else:
-                print("File transfer failed")
+                print("File transfer failed or was incomplete")
 
         except Exception as e:
             print(f"Error: {e}")
@@ -282,6 +280,8 @@ class ReliableUDPClient:
 
         finally:
             self.socket.close()
+            print("Client socket closed. Exiting.")
+            # The script will now naturally exit, and p2_exp.py will detect it
 
 def main():
     if len(sys.argv) != 4:

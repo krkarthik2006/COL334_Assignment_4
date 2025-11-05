@@ -27,8 +27,8 @@ class ReliableUDPServer:
         self.MSS = MSS
         # Increase socket buffer sizes for better performance
         try:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4194304)  # 4MB send buffer
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4194304)  # 4MB receive buffer
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)  # 8MB send buffer
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608)  # 8MB receive buffer
         except:
             pass
 
@@ -42,7 +42,7 @@ class ReliableUDPServer:
 
         # TCP CUBIC congestion control state
         self.cwnd = float(1 * MSS)  # Start with 1 MSS acc to assgn constraints
-        self.ssthresh = float(16 * MSS)  # Target: reach 64 MSS in slow start, then CUBIC takes over
+        self.ssthresh = float(64 * MSS)  # Target: reach 64 MSS in slow start, then CUBIC takes over
 
         # CUBIC specific state
         self.W_max = 0  # Window size at last congestion event (in MSS units)
@@ -166,7 +166,7 @@ class ReliableUDPServer:
             # Slower growth: increase by 50% per RTT instead of doubling
             # This gives more controlled ramp-up to avoid overwhelming network
             old_cwnd = self.cwnd
-            self.cwnd += acked_bytes * 0.5  # 50% increase per RTT
+            self.cwnd += acked_bytes * 0.9  # 50% increase per RTT
             self.tcp_cwnd = self.cwnd
 
             # Cap cwnd at maximum
@@ -254,7 +254,7 @@ class ReliableUDPServer:
         """
         # Prevent multiple congestion responses within one RTT
         current_time = time.time()
-        min_interval = self.srtt if self.srtt else 0.05  # Use estimated RTT or 50ms
+        min_interval = 2*self.srtt if self.srtt else 0.2
 
         if current_time - self.last_congestion_time < min_interval:
             # Too soon after last congestion event, ignore
@@ -354,8 +354,8 @@ class ReliableUDPServer:
         self.bytes_acked = 0
         self.last_log_time = self.start_time
         self.log_state(event="transfer_start", extra_info=f"file_size={total_size}")
-        max_burst_packets = 3
-        pacer_timeout = 0.00113
+        max_burst_packets = 15
+        pacer_interval = 0.001
         while base <= total_size:
             # Calculate in-flight bytes
             in_flight = next_seq - base
@@ -402,7 +402,7 @@ class ReliableUDPServer:
 
             # Use balanced timeout for ACK processing
             # Balance between responsiveness and CPU usage
-            ready = select.select([self.socket], [], [], pacer_timeout)  # 1ms timeout
+            ready = select.select([self.socket], [], [], pacer_interval)  # 50ms timeout
 
             if ready[0]:
                 # Receive all available ACKs

@@ -1,2 +1,0 @@
-bw,loss,delay_c2_ms,udp_off_mean,iter,md5_hash_1,md5_hash_2,ttc1,ttc2,size1_bytes,size2_bytes,thr1_mbps,thr2_mbps,link_util,jfi 
-100,0,5,None,0,67d9ea16a7ca6be5ba14a8def4dd8473,67d9ea16a7ca6be5ba14a8def4dd8473,28.538132,0.000000,32317690,32317690,9.059511,258541520000.000000,2585415200.090595,0.500000
